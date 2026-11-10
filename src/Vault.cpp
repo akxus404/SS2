@@ -108,63 +108,86 @@ VaultSettings fromJson(const QJsonObject& o) {
     return s;
 }
 
-// Cifrado de archivos en flujo: bloques de 1 MiB autenticados (secretstream XChaCha20-Poly1305).
+// Cifrado de archivos en flujo: cada bloque usa AEAD XChaCha20-Poly1305 con un nonce nuevo.
+// Esto evita depender de la firma exacta de secretstream que difiere entre versiones de libsodium.
 bool encryptStream(QIODevice& in, QIODevice& out, const unsigned char* key, qint64 total,
                    const Vault::Progress& prog) {
-    crypto_secretstream_xchacha20poly1305_state st;
-    unsigned char hdr[crypto_secretstream_xchacha20poly1305_HEADERBYTES];
-    if (crypto_secretstream_xchacha20poly1305_init_push(&st, hdr, key) != 0) return false;
-    if (out.write(reinterpret_cast<const char*>(hdr), qint64(sizeof hdr)) != qint64(sizeof hdr)) return false;
-
     std::vector<unsigned char> plain(std::size_t(kChunk));
-    std::vector<unsigned char> ct(std::size_t(kChunk) + crypto_secretstream_xchacha20poly1305_ABYTES);
+    std::vector<unsigned char> ct(std::size_t(kChunk) + crypto_aead_xchacha20poly1305_ietf_ABYTES);
+    unsigned char nonce[crypto_aead_xchacha20poly1305_ietf_NPUBBYTES];
     Wipe w1{plain.data(), plain.size()};
-    Wipe w2{&st, sizeof st};
 
     qint64 done = 0;
     for (;;) {
         const qint64 n = in.read(reinterpret_cast<char*>(plain.data()), kChunk);
         if (n < 0) return false;
-        const bool last = in.atEnd();
+        if (n == 0) {
+            if (in.atEnd()) break;
+            continue;
+        }
+
+        randombytes_buf(nonce, sizeof nonce);
         unsigned long long clen = 0;
-        crypto_secretstream_xchacha20poly1305_push(
-            &st, ct.data(), &clen, plain.data(), static_cast<unsigned long long>(n), nullptr, 0,
-            last ? crypto_secretstream_xchacha20poly1305_TAG_FINAL : crypto_secretstream_xchacha20poly1305_TAG_MESSAGE);
-        if (out.write(reinterpret_cast<const char*>(ct.data()), qint64(clen)) != qint64(clen)) return false;
+        if (crypto_aead_xchacha20poly1305_ietf_encrypt(
+                ct.data(), &clen,
+                plain.data(), static_cast<unsigned long long>(n),
+                nullptr, 0,
+                nullptr,
+                nonce,
+                key) != 0) {
+            return false;
+        }
+
+        if (out.write(reinterpret_cast<const char*>(nonce), qint64(sizeof nonce)) != qint64(sizeof nonce))
+            return false;
+        if (out.write(reinterpret_cast<const char*>(ct.data()), qint64(clen)) != qint64(clen))
+            return false;
+
         done += n;
         if (prog) prog(done, total);
-        if (last) break;
+        if (in.atEnd()) break;
     }
     return true;
 }
 
 bool decryptStream(QIODevice& in, QIODevice& out, const unsigned char* key, qint64 total,
                    const Vault::Progress& prog) {
-    unsigned char hdr[crypto_secretstream_xchacha20poly1305_HEADERBYTES];
-    if (in.read(reinterpret_cast<char*>(hdr), qint64(sizeof hdr)) != qint64(sizeof hdr)) return false;
-    crypto_secretstream_xchacha20poly1305_state st;
-    if (crypto_secretstream_xchacha20poly1305_init_pull(&st, hdr, key) != 0) return false;
-
-    constexpr qint64 kAbytes = crypto_secretstream_xchacha20poly1305_ABYTES;
-    std::vector<unsigned char> ct(std::size_t(kChunk + kAbytes));
+    std::vector<unsigned char> ct(std::size_t(kChunk) + crypto_aead_xchacha20poly1305_ietf_ABYTES);
     std::vector<unsigned char> plain(std::size_t(kChunk));
+    unsigned char nonce[crypto_aead_xchacha20poly1305_ietf_NPUBBYTES];
     Wipe w1{plain.data(), plain.size()};
-    Wipe w2{&st, sizeof st};
 
     qint64 done = 0;
     for (;;) {
-        const qint64 n = in.read(reinterpret_cast<char*>(ct.data()), kChunk + kAbytes);
-        if (n < kAbytes) return false;  // truncado o error de lectura
+        const qint64 nNonce = in.read(reinterpret_cast<char*>(nonce), qint64(sizeof nonce));
+        if (nNonce == 0) {
+            if (in.atEnd()) break;
+            return false;
+        }
+        if (nNonce != qint64(sizeof nonce)) return false;
+
+        const qint64 nCt = in.read(reinterpret_cast<char*>(ct.data()), qint64(ct.size()));
+        if (nCt <= 0) return false;
+
         unsigned long long plen = 0;
-        unsigned char tag = 0;
-        if (crypto_secretstream_xchacha20poly1305_pull(&st, plain.data(), &plen, &tag, ct.data(),
-                                                        static_cast<unsigned long long>(n), nullptr, 0) != 0)
-            return false;  // manipulado o clave incorrecta
-        if (out.write(reinterpret_cast<const char*>(plain.data()), qint64(plen)) != qint64(plen)) return false;
+        if (crypto_aead_xchacha20poly1305_ietf_decrypt(
+                plain.data(), &plen,
+                nullptr,
+                ct.data(), static_cast<unsigned long long>(nCt),
+                nullptr, 0,
+                nonce,
+                key) != 0) {
+            return false;
+        }
+
+        if (out.write(reinterpret_cast<const char*>(plain.data()), qint64(plen)) != qint64(plen))
+            return false;
+
         done += qint64(plen);
         if (prog) prog(done, total);
-        if (tag == crypto_secretstream_xchacha20poly1305_TAG_FINAL) return in.atEnd();
+        if (in.atEnd()) break;
     }
+    return true;
 }
 
 QString safeFileName(QString n) {
