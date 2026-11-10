@@ -13,6 +13,7 @@
 #include <QSet>
 #include <algorithm>
 #include <cstring>
+#include <vector>
 
 #ifdef Q_OS_WIN
 #ifndef NOMINMAX
@@ -108,8 +109,7 @@ VaultSettings fromJson(const QJsonObject& o) {
     return s;
 }
 
-// Cifrado de archivos en flujo: cada bloque usa AEAD XChaCha20-Poly1305 con un nonce nuevo.
-// Esto evita depender de la firma exacta de secretstream que difiere entre versiones de libsodium.
+// Compatible with the Windows libsodium version used by vcpkg: no extra `nsec` arg.
 bool encryptStream(QIODevice& in, QIODevice& out, const unsigned char* key, qint64 total,
                    const Vault::Progress& prog) {
     std::vector<unsigned char> plain(std::size_t(kChunk));
@@ -132,7 +132,6 @@ bool encryptStream(QIODevice& in, QIODevice& out, const unsigned char* key, qint
                 ct.data(), &clen,
                 plain.data(), static_cast<unsigned long long>(n),
                 nullptr, 0,
-                nullptr,
                 nonce,
                 key) != 0) {
             return false;
@@ -316,7 +315,7 @@ Vault::HeaderResult Vault::openHeader(const QByteArray& pw, SecretKey& vmkOut, Q
     }
     const unsigned char* nonce = base + kHeadLen;
     const unsigned char* ct = nonce + kNonce;
-    if (crypto_aead_xchacha20poly1305_ietf_decrypt(vmkOut.data(), nullptr, nullptr, ct, kKey + kTag, base,
+    if (crypto_aead_xchacha20poly1305_ietf_decrypt(vmkOut.data(), nullptr, ct, kKey + kTag, base,
                                                    kHeadLen, nonce, kek.data()) != 0) {
         vmkOut.clear();
         return HeaderResult::Wrong;
@@ -336,7 +335,7 @@ bool Vault::writeHeader(const unsigned char* salt, quint64 ops, quint64 mem, con
     randombytes_buf(nonce, sizeof nonce);
     QByteArray wrapped(kKey + kTag, '\0');
     crypto_aead_xchacha20poly1305_ietf_encrypt(u8(wrapped), nullptr, vmk_.data(), kKey, u8(blob),
-                                               static_cast<unsigned long long>(blob.size()), nullptr, nonce,
+                                               static_cast<unsigned long long>(blob.size()), nonce,
                                                kek.data());
     blob.append(reinterpret_cast<const char*>(nonce), kNonce);
     blob.append(wrapped);
@@ -354,9 +353,9 @@ bool Vault::loadIndex() {
     if (raw.size() < kNonce + kTag) return false;
     QByteArray plain(raw.size() - kNonce - kTag, '\0');
     unsigned long long plen = 0;
-    if (crypto_aead_xchacha20poly1305_ietf_decrypt(u8(plain), &plen, nullptr, u8(raw) + kNonce,
-                                                   static_cast<unsigned long long>(raw.size() - kNonce), nullptr, 0,
-                                                   u8(raw), ixKey_.data()) != 0)
+    if (crypto_aead_xchacha20poly1305_ietf_decrypt(u8(plain), &plen, u8(raw) + kNonce,
+                                                   static_cast<unsigned long long>(raw.size() - kNonce),
+                                                   nullptr, 0, u8(raw), ixKey_.data()) != 0)
         return false;
     plain.truncate(qsizetype(plen));
     const QJsonObject root = QJsonDocument::fromJson(plain).object();
@@ -413,7 +412,8 @@ bool Vault::saveIndex() {
     QByteArray out(kNonce + plain.size() + kTag, '\0');
     std::memcpy(out.data(), nonce, kNonce);
     crypto_aead_xchacha20poly1305_ietf_encrypt(u8(out) + kNonce, nullptr, u8(plain),
-                                               static_cast<unsigned long long>(plain.size()), nullptr, 0, nullptr,
+                                               static_cast<unsigned long long>(plain.size()),
+                                               nullptr, 0,
                                                nonce, ixKey_.data());
     sodium_memzero(plain.data(), std::size_t(plain.size()));
     return replaceFile(indexPath(), out);
@@ -733,7 +733,7 @@ bool Vault::exportItem(const QString& id, const QString& destDir, const Progress
     }
 
     QFile in(blobPath(it.id));
-    if (!in.open(QIODevice::ReadOnly)) return fail(err, QObject::tr("Falta el archivo cifrado de «%1».").arg(it.name));
+    if (!in.open(QIODevice::ReadOnly)) return fail(err, QObject::tr("Falta el archivo cifrado de «%1»." ).arg(it.name));
     const QString outPath = uniquePath(QDir(destDir).filePath(safeFileName(it.name)));
     bool ok = false;
     {
