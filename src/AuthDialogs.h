@@ -2,13 +2,13 @@
 
 #include <QByteArray>
 #include <QDialog>
+#include <QLineEdit>
 #include <QString>
 
 #include "Vault.h"
 
 class QCheckBox;
 class QLabel;
-class QLineEdit;
 class QProgressBar;
 class QPushButton;
 class QTimer;
