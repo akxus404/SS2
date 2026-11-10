@@ -1,0 +1,82 @@
+name: Compilar SecureSpace
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:   # permite lanzarlo a mano desde la pestaña Actions
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Linux (x86-64)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalar dependencias
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build pkg-config \
+            qt6-base-dev libsodium-dev libgl1-mesa-dev libxkbcommon-dev
+
+      - name: Configurar
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Compilar
+        run: cmake --build build -j
+
+      - name: Empaquetar
+        run: |
+          mkdir -p dist
+          cp build/SecureSpace dist/
+          strip dist/SecureSpace
+          ldd dist/SecureSpace || true
+          tar -czf SecureSpace-linux-x86_64.tar.gz -C dist SecureSpace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SecureSpace-linux
+          path: SecureSpace-linux-x86_64.tar.gz
+
+  windows:
+    name: Windows (x64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalar Qt 6
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.*'
+          cache: true
+
+      - name: Instalar libsodium (vcpkg)
+        run: '& "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install libsodium:x64-windows'
+
+      - name: Configurar
+        run: >
+          cmake -S . -B build
+          -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+          -DVCPKG_TARGET_TRIPLET=x64-windows
+          -DCMAKE_PREFIX_PATH="$env:QT_ROOT_DIR"
+
+      - name: Compilar
+        run: cmake --build build --config Release
+
+      - name: Empaquetar (.exe + DLL necesarias)
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item build/Release/* dist -Exclude *.pdb
+          if (-not (Test-Path dist/libsodium.dll)) {
+            Copy-Item "$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows/bin/libsodium.dll" dist
+          }
+          windeployqt --release --no-translations dist/SecureSpace.exe
+          Compress-Archive -Path dist/* -DestinationPath SecureSpace-windows-x64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SecureSpace-windows
+          path: SecureSpace-windows-x64.zip
