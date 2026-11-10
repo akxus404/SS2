@@ -20,10 +20,20 @@ else()
   set(SS_SODIUM_TARGET unofficial-sodium::sodium)
 endif()
 
+# MSVC parses vector<T> value(std::size_t(expr)); as a function declaration (the
+# most-vexing parse). Generate the build input with an unambiguous size/value
+# constructor so the vectors and downstream libsodium calls are compiled correctly.
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/src/Vault.cpp" SS_VAULT_CPP)
+string(REPLACE
+  "std::vector<unsigned char> plain(std::size_t(kChunk));"
+  "std::vector<unsigned char> plain(static_cast<std::size_t>(kChunk), 0);"
+  SS_VAULT_CPP "${SS_VAULT_CPP}")
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/Vault.cpp" "${SS_VAULT_CPP}")
+
 add_executable(SecureSpace WIN32 MACOSX_BUNDLE
   src/main.cpp
   src/Theme.cpp
-  src/Vault.cpp
+  "${CMAKE_CURRENT_BINARY_DIR}/Vault.cpp"
   src/AuthDialogs.cpp
   src/MainWindow.cpp
   src/SettingsDialog.cpp
